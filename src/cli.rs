@@ -101,8 +101,9 @@ pub struct DumpToUrdfArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
 
-    #[arg(long, default_value = "onshape_robot")]
-    pub robot: String,
+    /// URDF robot name (defaults to document name when available).
+    #[arg(long)]
+    pub robot: Option<String>,
 
     #[arg(long, default_value = "")]
     pub mesh_prefix: String,

@@ -129,6 +129,9 @@ pub async fn run(args: FetchSnapshotRecursiveArgs) -> Result<()> {
         effective_wvmid = microversion.clone();
         pinned_microversion = Some(microversion);
     }
+    let document_name = fetch_document_name(&client, &api_base, &did, &auth_header)
+        .await
+        .unwrap_or(None);
 
     let mut queue = VecDeque::new();
     queue.push_back(QueueItem::Root {
@@ -185,6 +188,7 @@ pub async fn run(args: FetchSnapshotRecursiveArgs) -> Result<()> {
         "apiVersion": args.api_version,
         "root": {
             "did": did,
+            "documentName": document_name,
             "sourceWvm": source_wvm.as_str(),
             "sourceWvmid": source_wvmid,
             "eid": eid,
@@ -472,6 +476,35 @@ async fn fetch_json(client: &Client, url: &str, auth_header: &str) -> Result<Val
     }
 
     serde_json::from_str(&body).context("failed to parse response JSON")
+}
+
+async fn fetch_document_name(
+    client: &Client,
+    api_base: &str,
+    did: &str,
+    auth_header: &str,
+) -> Result<Option<String>> {
+    let url = format!("{api_base}/documents/{did}");
+    let response = client
+        .get(&url)
+        .header(AUTHORIZATION, auth_header)
+        .send()
+        .await
+        .with_context(|| format!("request failed: GET {url}"))?;
+
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let body: Value = response
+        .json()
+        .await
+        .context("failed to parse document metadata response")?;
+
+    Ok(body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string))
 }
 
 async fn fetch_bytes_follow_redirect(

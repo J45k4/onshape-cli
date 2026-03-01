@@ -37,9 +37,20 @@ pub fn run(args: DumpToUrdfArgs) -> Result<()> {
         .or(args.dump_positional)
         .unwrap_or_else(|| PathBuf::from("dump"));
     let (dump_dir, assembly_root_path) = resolve_dump_paths(&dump_input);
+    let inferred_name = infer_document_name(&dump_dir)
+        .map(|name| sanitize_name(&name))
+        .filter(|name| !name.is_empty() && name != "item");
 
-    let out_file = args.out.unwrap_or_else(|| dump_dir.join("robot.urdf"));
-    let robot_name = sanitize_name(&args.robot);
+    let out_file = args.out.unwrap_or_else(|| {
+        let stem = inferred_name.as_deref().unwrap_or("robot");
+        dump_dir.join(format!("{stem}.urdf"))
+    });
+    let robot_name = args
+        .robot
+        .as_deref()
+        .map(sanitize_name)
+        .or_else(|| inferred_name.clone())
+        .unwrap_or_else(|| "onshape_robot".to_string());
     let mesh_prefix = args.mesh_prefix;
     let mesh_scale = args.mesh_scale;
     let emit_collision = !args.no_collision;
@@ -200,6 +211,16 @@ fn resolve_dump_paths(input: &Path) -> (PathBuf, PathBuf) {
     } else {
         (input.to_path_buf(), input.join("assembly_root.json"))
     }
+}
+
+fn infer_document_name(dump_dir: &Path) -> Option<String> {
+    let manifest_path = dump_dir.join("manifest.json");
+    let manifest: Value = read_json(&manifest_path).ok()?;
+    manifest
+        .get("root")
+        .and_then(|root| root.get("documentName"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn collect_all_instances(dump_dir: &Path, root_asm: &AssemblyResponse) -> Result<Vec<Instance>> {
@@ -687,12 +708,14 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EmittedPart, build_joints, matrix_from_transform, matrix_rotation3, resolve_dump_paths,
-        rpy_from_rotation,
+        EmittedPart, build_joints, infer_document_name, matrix_from_transform, matrix_rotation3,
+        resolve_dump_paths, rpy_from_rotation,
     };
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn identity_rotation_has_zero_rpy() {
@@ -796,5 +819,27 @@ mod tests {
             .expect("root part should be attached to base");
         assert_eq!(root_joint.child_link, "parent");
         assert_eq!(root_joint.joint_type, "fixed");
+    }
+
+    #[test]
+    fn infer_document_name_reads_manifest() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("onshape-cli-test-{nonce}"));
+        fs::create_dir_all(&tmp_dir).expect("temp dir should create");
+        let manifest_path = tmp_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            r#"{"root":{"documentName":"Puppy Arm v1"}}"#,
+        )
+        .expect("manifest should write");
+
+        let inferred = infer_document_name(&tmp_dir);
+        assert_eq!(inferred.as_deref(), Some("Puppy Arm v1"));
+
+        let _ = fs::remove_file(manifest_path);
+        let _ = fs::remove_dir(tmp_dir);
     }
 }
