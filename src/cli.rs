@@ -14,7 +14,7 @@ pub enum Commands {
     /// Recursively fetch assembly snapshots and optionally download part STL meshes.
     #[command(name = "fetch")]
     FetchSnapshotRecursive(FetchSnapshotRecursiveArgs),
-    /// Convert an Onshape dump folder into a simple fixed-joint URDF.
+    /// Convert an Onshape dump folder into a URDF using assembly mate joints when available.
     DumpToUrdf(DumpToUrdfArgs),
 }
 
