@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
 };
@@ -31,6 +31,13 @@ struct EmittedJoint {
     axis: Option<[f64; 3]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AssemblyKey {
+    did: String,
+    mv: String,
+    eid: String,
+}
+
 pub fn run(args: DumpToUrdfArgs) -> Result<()> {
     let dump_input = args
         .dump
@@ -60,6 +67,7 @@ pub fn run(args: DumpToUrdfArgs) -> Result<()> {
     let mesh_index_path = dump_dir.join("mesh_index.json");
 
     let root_asm: AssemblyResponse = read_json(&assembly_root_path)?;
+    let subassembly_lookup = load_subassembly_lookup(&dump_dir)?;
     let mesh_index: HashMap<String, String> = if mesh_index_path.exists() {
         read_json(&mesh_index_path)?
     } else {
@@ -154,17 +162,13 @@ pub fn run(args: DumpToUrdfArgs) -> Result<()> {
         );
     }
 
-    let features = root_asm
-        .root_assembly
-        .as_ref()
-        .map(|root| root.features.as_slice())
-        .unwrap_or(&[]);
+    let features = collect_mate_features(&root_asm, &subassembly_lookup);
 
     let mut used_joint_names = HashSet::new();
     let joints = build_joints(
         &emitted,
         &parts_by_occurrence,
-        features,
+        &features,
         &mut used_joint_names,
     );
 
@@ -221,6 +225,161 @@ fn infer_document_name(dump_dir: &Path) -> Option<String> {
         .and_then(|root| root.get("documentName"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn load_subassembly_lookup(dump_dir: &Path) -> Result<HashMap<AssemblyKey, AssemblyResponse>> {
+    let mut lookup = HashMap::new();
+    let assemblies_dir = dump_dir.join("assemblies");
+    if !assemblies_dir.exists() {
+        return Ok(lookup);
+    }
+
+    for entry in fs::read_dir(&assemblies_dir)
+        .with_context(|| format!("failed to read {}", assemblies_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let assembly: AssemblyResponse = match read_json(&path) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let Some(key) = assembly_key_from_response(&assembly) else {
+            continue;
+        };
+        lookup.insert(key, assembly);
+    }
+
+    Ok(lookup)
+}
+
+fn assembly_key_from_response(assembly: &AssemblyResponse) -> Option<AssemblyKey> {
+    let root = assembly.root_assembly.as_ref()?;
+    Some(AssemblyKey {
+        did: non_empty(root.document_id.as_deref())?.to_string(),
+        mv: non_empty(root.document_microversion.as_deref())?.to_string(),
+        eid: non_empty(root.element_id.as_deref())?.to_string(),
+    })
+}
+
+fn assembly_key_from_instance(instance: &Instance) -> Option<AssemblyKey> {
+    Some(AssemblyKey {
+        did: non_empty(instance.document_id.as_deref())?.to_string(),
+        mv: non_empty(instance.document_microversion.as_deref())?.to_string(),
+        eid: non_empty(instance.element_id.as_deref())?.to_string(),
+    })
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    let candidate = value?.trim();
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+fn collect_mate_features(
+    root_assembly: &AssemblyResponse,
+    subassemblies: &HashMap<AssemblyKey, AssemblyResponse>,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut queue: VecDeque<(Vec<String>, Option<AssemblyKey>)> = VecDeque::new();
+    let mut visited = HashSet::new();
+
+    queue.push_back((Vec::new(), None));
+
+    while let Some((prefix, key)) = queue.pop_front() {
+        let visit_key = format!(
+            "{}::{}",
+            key.as_ref()
+                .map(|value| format!("{}:{}:{}", value.did, value.mv, value.eid))
+                .unwrap_or_else(|| "ROOT".to_string()),
+            occurrence_path_key(&prefix)
+        );
+        if !visited.insert(visit_key) {
+            continue;
+        }
+
+        let assembly = match &key {
+            Some(sub_key) => {
+                let Some(found) = subassemblies.get(sub_key) else {
+                    continue;
+                };
+                found
+            }
+            None => root_assembly,
+        };
+
+        let Some(root) = assembly.root_assembly.as_ref() else {
+            continue;
+        };
+
+        for feature in &root.features {
+            out.push(prefix_feature_occurrences(feature, &prefix));
+        }
+
+        for instance in &root.instances {
+            if instance.suppressed.unwrap_or(false) {
+                continue;
+            }
+            if !instance
+                .kind
+                .as_deref()
+                .map(|kind| kind.eq_ignore_ascii_case("assembly"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(instance_id) = non_empty(Some(instance.id.as_str())) else {
+                continue;
+            };
+            let Some(child_key) = assembly_key_from_instance(instance) else {
+                continue;
+            };
+            if !subassemblies.contains_key(&child_key) {
+                continue;
+            }
+
+            let mut child_prefix = prefix.clone();
+            child_prefix.push(instance_id.to_string());
+            queue.push_back((child_prefix, Some(child_key)));
+        }
+    }
+
+    out
+}
+
+fn prefix_feature_occurrences(feature: &Value, prefix: &[String]) -> Value {
+    if prefix.is_empty() {
+        return feature.clone();
+    }
+
+    let mut out = feature.clone();
+    let Some(mated_entities) = out
+        .get_mut("featureData")
+        .and_then(|value| value.get_mut("matedEntities"))
+        .and_then(Value::as_array_mut)
+    else {
+        return out;
+    };
+
+    for entity in mated_entities {
+        let Some(path) = entity.get_mut("matedOccurrence").and_then(Value::as_array_mut) else {
+            continue;
+        };
+
+        let mut absolute = Vec::with_capacity(prefix.len() + path.len());
+        absolute.extend(prefix.iter().cloned().map(Value::String));
+        absolute.extend(path.iter().cloned());
+        *path = absolute;
+    }
+
+    out
 }
 
 fn collect_all_instances(dump_dir: &Path, root_asm: &AssemblyResponse) -> Result<Vec<Instance>> {

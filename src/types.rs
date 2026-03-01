@@ -10,6 +10,12 @@ pub struct AssemblyResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootAssembly {
+    #[serde(rename = "documentId")]
+    pub document_id: Option<String>,
+    #[serde(rename = "documentMicroversion")]
+    pub document_microversion: Option<String>,
+    #[serde(rename = "elementId")]
+    pub element_id: Option<String>,
     #[serde(default)]
     pub instances: Vec<Instance>,
     #[serde(default)]
